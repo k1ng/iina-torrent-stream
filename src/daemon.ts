@@ -1,5 +1,5 @@
 // daemon.ts — manages the native `torrentd` companion process: downloading the
-// binary on first use, spawning it, discovering its port, and talking to its
+// locally verified binary, discovering its port, and talking to its
 // localhost HTTP API.
 //
 // IINA plugins run in a sandboxed JavaScriptCore engine with no sockets, so the
@@ -9,6 +9,8 @@
 // the main and the global plugin entries.
 
 import { opt } from "./options";
+import { ensureLocalBinary } from "./binary";
+import checksums from "../build/daemon-checksums.json";
 import { diag } from "./log";
 import { SingleFlight, withDaemonToken } from "./plugin-logic";
 import type { CancelFn } from "./util";
@@ -17,12 +19,6 @@ const { http, utils, file, console } = iina;
 
 // --- Configuration ----------------------------------------------------------
 
-// GitHub repository hosting the torrentd release binaries. Release assets must
-// be named `torrentd-darwin-arm64` and `torrentd-darwin-x86_64`.
-const DAEMON_REPO = "n0madic/iina-torrent-stream";
-const DAEMON_VERSION = "v0.1.3";
-
-const BIN_PATH = "@data/torrentd";
 const STATE_PATH = "@data/torrentd.json";
 // The daemon's singleton flock; removed by the owner on a clean exit. Its
 // absence — not the state file's — is what tells us the lock is free again.
@@ -31,15 +27,6 @@ const LOCK_PATH = "@data/torrentd.lock";
 // window, before it shuts down and purges its disk cache. Kept short so the
 // cache is reclaimed promptly once the last torrent window closes.
 const IDLE_TIMEOUT = "30s";
-
-// SHA-256 checksums of the release binaries, injected at release time by the
-// GitHub Actions workflow (.github/workflows/release.yml). Empty values are
-// accepted only when an already-installed binary reports version "dev";
-// downloading any executable without a pinned checksum fails closed.
-const EXPECTED_SHA256: Record<string, string> = {
-  arm64: "",
-  x86_64: "",
-};
 
 // --- Types ------------------------------------------------------------------
 
@@ -102,165 +89,10 @@ function errorText(res: IINA.HTTPResponse): string {
 
 // --- Binary management ------------------------------------------------------
 
-/** Detects the host CPU architecture as used in the release asset names.
- * Throws on anything other than arm64 / x86_64 — silently mapping unknowns
- * to x86_64 produced "torrent engine did not start in time" errors with no
- * useful diagnosis when the user was on an unsupported platform. */
-async function detectArch(): Promise<string> {
-  const { status, stdout } = await utils.exec("/usr/bin/uname", ["-m"]);
-  if (status !== 0) {
-    throw new Error("could not detect CPU architecture");
-  }
-  const arch = stdout.trim();
-  if (arch === "arm64") return "arm64";
-  if (arch === "x86_64") return "x86_64";
-  throw new Error(`unsupported CPU architecture: ${arch || "<empty>"}`);
-}
-
-/** Verifies the downloaded binary against a known checksum, if one is set. */
-async function verifyChecksum(
-  resolvedPath: string,
-  arch: string,
-): Promise<void> {
-  const expected = EXPECTED_SHA256[arch];
-  if (!expected) {
-    throw new Error(
-      `this source build has no pinned SHA-256 for ${arch}; run "make dev-daemon" for local development`,
-    );
-  }
-  const { status, stdout } = await utils.exec("/usr/bin/shasum", [
-    "-a",
-    "256",
-    resolvedPath,
-  ]);
-  if (status !== 0) {
-    // Delete the unverified binary too — otherwise the next ensureBinary
-    // call sees the file already on disk and short-circuits past the whole
-    // verification step, silently shipping an unchecked executable.
-    file.delete(BIN_PATH);
-    throw new Error("could not compute the binary checksum");
-  }
-  const actual = stdout.trim().split(/\s+/)[0].toLowerCase();
-  if (actual !== expected.toLowerCase()) {
-    file.delete(BIN_PATH);
-    throw new Error("torrentd checksum mismatch — the download may be corrupt");
-  }
-}
-
-/** Probes the on-disk binary's reported version. Returns null if the binary
- * cannot be invoked (e.g. permission, wrong arch). */
-async function probeBinaryVersion(resolved: string): Promise<string | null> {
-  try {
-    const { status, stdout } = await utils.exec(resolved, ["--version"]);
-    if (status !== 0) return null;
-    return stdout.trim();
-  } catch {
-    return null;
-  }
-}
-
-/** Downloads, verifies, and prepares the daemon binary at BIN_PATH. The
- * partial-file cleanup is critical: a half-written binary left from a failed
- * download would otherwise be picked up by the next ensureBinary() call as
- * "already present" and shipped to the user unchecked. */
-async function downloadFreshBinary(arch: string): Promise<string> {
-  if (!EXPECTED_SHA256[arch]) {
-    throw new Error(
-      `this source build has no pinned SHA-256 for ${arch}; run "make dev-daemon" for local development`,
-    );
-  }
-  const asset = `torrentd-darwin-${arch}`;
-  const url = `https://github.com/${DAEMON_REPO}/releases/download/${DAEMON_VERSION}/${asset}`;
-  diag(`downloading ${url}`);
-
-  try {
-    await http.download(url, BIN_PATH);
-  } catch (e) {
-    // A partial file MUST be removed — otherwise the next ensureBinary
-    // call sees BIN_PATH "present" and short-circuits past the download
-    // and checksum verification, silently running a truncated binary.
-    try {
-      file.delete(BIN_PATH);
-    } catch {
-      /* best-effort */
-    }
-    throw e;
-  }
-
-  const resolved = utils.resolvePath(BIN_PATH);
-
-  try {
-    await verifyChecksum(resolved, arch);
-    await utils.exec("/bin/chmod", ["+x", resolved]);
-    await utils.exec("/usr/bin/xattr", [
-      "-dr",
-      "com.apple.quarantine",
-      resolved,
-    ]);
-  } catch (e) {
-    // Same logic: if anything in the post-download setup fails we cannot
-    // leave a binary on disk that the next call would treat as "ready".
-    try {
-      file.delete(BIN_PATH);
-    } catch {
-      /* best-effort */
-    }
-    throw e;
-  }
-
-  diag(`daemon binary ready: ${resolved}`);
-  return resolved;
-}
-
-/**
- * Ensures the daemon binary exists locally, downloading it from GitHub releases
- * on first use. Returns the resolved absolute path to the executable.
- *
- * Also handles the "plugin updated, binary stale" case: a `torrentd --version`
- * probe compares the on-disk binary's version against DAEMON_VERSION (which
- * the release workflow injects). On mismatch the binary is removed and a
- * fresh one is downloaded. Dev builds (binaries reporting "dev") are accepted
- * unconditionally so `make dev-daemon` keeps working without round-tripping
- * through a GitHub release.
- */
+// Executables are installed from the locally built offline kit. No downloader,
+// version-probe execution, development bypass, or upstream fallback exists.
 async function ensureBinary(): Promise<string> {
-  const arch = await detectArch();
-
-  if (utils.fileInPath(BIN_PATH)) {
-    const resolved = utils.resolvePath(BIN_PATH);
-    const installedVersion = await probeBinaryVersion(resolved);
-    const expectedVersion = DAEMON_VERSION.replace(/^v/, "");
-
-    if (installedVersion === null) {
-      // Could not run the binary at all — treat it as broken and re-download.
-      diag("daemon binary present but --version failed; re-downloading");
-      try {
-        file.delete(BIN_PATH);
-      } catch {
-        /* best-effort */
-      }
-    } else if (installedVersion === "dev") {
-      diag(
-        `daemon binary is a dev build, skipping version check (${resolved})`,
-      );
-      return resolved;
-    } else if (installedVersion !== expectedVersion) {
-      diag(
-        `daemon binary version ${installedVersion} != expected ${expectedVersion} — re-downloading`,
-      );
-      try {
-        file.delete(BIN_PATH);
-      } catch {
-        /* best-effort */
-      }
-    } else {
-      diag(`daemon binary present (v${installedVersion}): ${resolved}`);
-      return resolved;
-    }
-  }
-
-  diag("daemon binary missing or stale — downloading");
-  return await downloadFreshBinary(arch);
+  return ensureLocalBinary(checksums);
 }
 
 // --- Lifecycle --------------------------------------------------------------
