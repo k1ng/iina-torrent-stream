@@ -110,7 +110,7 @@ func main() {
 		return
 	}
 
-	if err := os.MkdirAll(cfg.dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.dataDir, 0o700); err != nil {
 		log.Fatalf("create data dir: %v", err)
 	}
 
@@ -163,7 +163,7 @@ func main() {
 	if err := os.RemoveAll(cfg.cacheDir); err != nil {
 		log.Printf("warning: could not purge stale cache: %v", err)
 	}
-	if err := os.MkdirAll(cfg.cacheDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.cacheDir, 0o700); err != nil {
 		log.Fatalf("create cache dir: %v", err)
 	}
 	// Always purge the cache on the way out — including on a panic inside
